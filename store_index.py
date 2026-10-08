@@ -170,7 +170,7 @@ print("Retriever ready")
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 chatModel = ChatGoogleGenerativeAI(
-    model="gemini-3.8-flash"
+     model="gemini-3.5-flash-lite"
 )
 
 response = chatModel.invoke("Hello, are you working?")
