@@ -22,3 +22,18 @@ conda activate medibot
 ```bash
 pip install -r requirements.txt
 ```
+
+
+### Techstacks:
+
+Python
+Langchain
+Flask
+Gemini
+Pinecone
+
+### Tools:
+
+Anaconda Prompt
+Git Bash
+VS Code
