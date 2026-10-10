@@ -8,10 +8,11 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone
 
 from src.helper import download_hugging_face_embeddings
 from src.prompt import prompt
+from src.pinecone_retriever import DirectPineconeRetriever
 
 load_dotenv()
 app = Flask(__name__)
@@ -29,7 +30,7 @@ def build_chain():
     pinecone_key = os.getenv("PINECONE_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY")
     index_name = os.getenv("PINECONE_INDEX_NAME", "medical-chatbot")
-    model_name = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GOOGLE_MODEL", "gemini-3.8-flash")
 
     missing = [
         name for name, value in (
@@ -47,13 +48,9 @@ def build_chain():
     os.environ["GOOGLE_API_KEY"] = google_key
 
     embeddings = download_hugging_face_embeddings()
-    vector_store = PineconeVectorStore.from_existing_index(
-        index_name=index_name,
-        embedding=embeddings,
-    )
-    retriever = vector_store.as_retriever(
-        search_type="similarity", search_kwargs={"k": 3}
-    )
+    pinecone = Pinecone(api_key=pinecone_key)
+    index = pinecone.Index(index_name)
+    retriever = DirectPineconeRetriever(index=index, embeddings=embeddings, k=3)
     model = ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=google_key,
