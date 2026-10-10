@@ -1,195 +1,106 @@
-from flask import Flask, render_template, request
+import os
+from functools import lru_cache
 
 from dotenv import load_dotenv
-
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-
-from langchain_pinecone import PineconeVectorStore
-from langchain_google_genai import ChatGoogleGenerativeAI
-
+from flask import Flask, jsonify, render_template, request
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_pinecone import PineconeVectorStore
 
 from src.helper import download_hugging_face_embeddings
 from src.prompt import prompt
 
-import os
-
-
-# =========================================================
-# Flask App
-# =========================================================
-
-app = Flask(__name__)
-
-
-# =========================================================
-# Load Environment Variables
-# =========================================================
-
 load_dotenv()
-
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-if not PINECONE_API_KEY:
-    raise ValueError("PINECONE_API_KEY not found in .env")
-
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY not found in .env")
-
-os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-
-
-# =========================================================
-# Load Hugging Face Embeddings
-# =========================================================
-
-embeddings = download_hugging_face_embeddings()
-
-
-# =========================================================
-# Connect to Existing Pinecone Index
-# =========================================================
-
-index_name = "medical-chatbot"
-
-docsearch = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
-    embedding=embeddings
-)
-
-retriever = docsearch.as_retriever(
-    search_type="similarity",
-    search_kwargs={
-        "k": 3
-    }
-)
-
-
-# =========================================================
-# Gemini Model
-# =========================================================
-
-chatModel = ChatGoogleGenerativeAI(
-     model="gemini-3.5-flash-lite"
-)
-
-
-# =========================================================
-# Create RAG Chain
-# =========================================================
-
-question_answer_chain = create_stuff_documents_chain(
-    chatModel,
-    prompt
-)
-
-rag_chain = create_retrieval_chain(
-    retriever,
-    question_answer_chain
-)
-
-
-# =========================================================
-# Conversation Memory
-# =========================================================
-
+app = Flask(__name__)
 store = {}
 
 
-def get_session_history(session_id):
+def get_session_history(session_id: str):
     if session_id not in store:
         store[session_id] = InMemoryChatMessageHistory()
-
     return store[session_id]
 
 
-rag_chain_with_history = RunnableWithMessageHistory(
-    rag_chain,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="chat_history",
-    output_messages_key="answer"
-)
+@lru_cache(maxsize=1)
+def build_chain():
+    pinecone_key = os.getenv("PINECONE_API_KEY")
+    google_key = os.getenv("GOOGLE_API_KEY")
+    index_name = os.getenv("PINECONE_INDEX_NAME", "medical-chatbot")
+    model_name = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
 
+    missing = [
+        name for name, value in (
+            ("PINECONE_API_KEY", pinecone_key),
+            ("GOOGLE_API_KEY", google_key),
+        ) if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing environment variable(s): " + ", ".join(missing)
+            + ". Copy .env.example to .env and add your API keys."
+        )
 
-print("RAG chain created successfully!")
+    os.environ["PINECONE_API_KEY"] = pinecone_key
+    os.environ["GOOGLE_API_KEY"] = google_key
 
+    embeddings = download_hugging_face_embeddings()
+    vector_store = PineconeVectorStore.from_existing_index(
+        index_name=index_name,
+        embedding=embeddings,
+    )
+    retriever = vector_store.as_retriever(
+        search_type="similarity", search_kwargs={"k": 3}
+    )
+    model = ChatGoogleGenerativeAI(
+        model=model_name,
+        google_api_key=google_key,
+        temperature=0.2,
+    )
+    answer_chain = create_stuff_documents_chain(model, prompt)
+    rag_chain = create_retrieval_chain(retriever, answer_chain)
+    return RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
 
-# =========================================================
-# Home Page
-# =========================================================
 
 @app.route("/")
 def index():
     return render_template("chat.html")
 
 
-# =========================================================
-# Chat Endpoint
-# =========================================================
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
-@app.route("/get", methods=["GET", "POST"])
+
+@app.route("/get", methods=["POST"])
 def chat():
-
-    msg = request.form.get("msg", "").strip()
-
+    payload = request.get_json(silent=True) or {}
+    msg = (request.form.get("msg") or payload.get("msg") or "").strip()
     if not msg:
-        return "Please enter a question."
-
-    print("Question:", msg)
+        return "Please enter a question.", 400
 
     try:
-
-        response = rag_chain_with_history.invoke(
-            {
-                "input": msg
-            },
-            config={
-                "configurable": {
-                    "session_id": "default"
-                }
-            }
+        chain = build_chain()
+        response = chain.invoke(
+            {"input": msg},
+            config={"configurable": {"session_id": request.form.get("session_id", "default")}},
         )
-
-        answer = response["answer"]
-
-        print("Response:", answer)
-
-        return str(answer)
-
-    except Exception as e:
-
-        print("ERROR:", e)
-
-        error_message = str(e)
-
-        # Gemini quota error
-        if "429" in error_message or "ResourceExhausted" in error_message:
-
-            return (
-                "The AI service has reached its current Gemini API quota. "
-                "Please try again later or use another available Gemini model."
-            )
-
-        # Other errors
+        return str(response.get("answer", "Sorry, I couldn't generate an answer."))
+    except Exception:
+        app.logger.exception("Chat request failed")
         return (
-            "Sorry, something went wrong while generating the answer. "
-            "Please try again."
-        )
+            "The chatbot could not answer right now. Check that your API keys are valid, "
+            "the Pinecone index exists and contains medical documents, and your API quota is available."
+        ), 503
 
-
-# =========================================================
-# Run Flask
-# =========================================================
 
 if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=8080,
-        debug=True
-    )
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
